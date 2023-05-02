@@ -1,3 +1,4 @@
+use bevy::window::PrimaryWindow;
 use bevy_matchbox::prelude::PeerId;
 use ggrs::Config;
 
@@ -33,13 +34,23 @@ impl Config for GGRSConfig {
 
 /// Our primary data struct; what players send to one another
 #[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Pod, Zeroable)]
 pub struct GGRSInput {
     // The input from our player
     pub input: u16,
+    _padding1: u16, // Keep things 32-bit-aligned for Bytemuck
+
+    pub mouse_visible: u8,
+    pub mouse_clicked: u8,
+    _padding2: u16, // Keep things 32-bit-aligned for Bytemuck
+
+    pub mouse_x: i32,
+    pub mouse_y: i32,
 
     // Desync detection
     pub last_confirmed_hash: u16,
+    _padding3: u16, // Keep things 32-bit-aligned for Bytemuck
+
     pub last_confirmed_frame: Frame,
     // Ok, so I know what you're thinking:
     // > "That's not input!"
@@ -60,10 +71,14 @@ pub fn input(
     physics_enabled: Res<PhysicsEnabled>,
     mut hashes: ResMut<FrameHashes>,
     validatable_frame: Res<ValidatableFrame>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    mouse_buttons: Res<Input<MouseButton>>,
 ) -> GGRSInput {
-    let mut input: u16 = 0;
-    let mut last_confirmed_frame = ggrs::NULL_FRAME;
-    let mut last_confirmed_hash = 0;
+    let mut input = GGRSInput {
+        last_confirmed_frame: ggrs::NULL_FRAME,
+        ..default()
+    };
 
     // Find a hash that we haven't sent yet.
     // This probably seems like overkill but we have to track a bunch anyway, we
@@ -79,56 +94,66 @@ pub fn input(
             && validatable_frame.is_validatable(frame_hash.frame)
         {
             info!("Sending data {:?}", frame_hash);
-            last_confirmed_frame = frame_hash.frame;
-            last_confirmed_hash = frame_hash.rapier_checksum;
+            input.last_confirmed_frame = frame_hash.frame;
+            input.last_confirmed_hash = frame_hash.rapier_checksum;
             frame_hash.sent = true;
         }
     }
 
     // Do not do anything until physics are live
     if !physics_enabled.0 {
-        return GGRSInput {
-            input,
-            last_confirmed_frame,
-            last_confirmed_hash,
-        };
+        return input;
     }
 
     // Build the input
     if keyboard_input.pressed(KeyCode::W) {
-        input |= INPUT_UP;
+        input.input |= INPUT_UP;
     }
     if keyboard_input.pressed(KeyCode::A) {
-        input |= INPUT_LEFT;
+        input.input |= INPUT_LEFT;
     }
     if keyboard_input.pressed(KeyCode::S) {
-        input |= INPUT_DOWN;
+        input.input |= INPUT_DOWN;
     }
     if keyboard_input.pressed(KeyCode::D) {
-        input |= INPUT_RIGHT;
+        input.input |= INPUT_RIGHT;
     }
 
     // toggle off random input if our local moves at all
-    if input != 0 && random.on && local_handles.handles.contains(&handle.0) {
+    if input.input != 0 && random.on && local_handles.handles.contains(&handle.0) {
         random.on = false;
-    } else if input == 0 && random.on && local_handles.handles.contains(&handle.0) {
+    } else if input.input == 0 && random.on && local_handles.handles.contains(&handle.0) {
         let mut rng = thread_rng();
         // Return a random input sometimes, or maybe nothing.
         // Helps to trigger input-based rollbacks from the unplayed side
         match rng.gen_range(0..10) {
-            0 => input = INPUT_UP,
-            1 => input = INPUT_LEFT,
-            2 => input = INPUT_DOWN,
-            3 => input = INPUT_RIGHT,
+            0 => input.input = INPUT_UP,
+            1 => input.input = INPUT_LEFT,
+            2 => input.input = INPUT_DOWN,
+            3 => input.input = INPUT_RIGHT,
             _ => (),
         }
     }
 
-    GGRSInput {
-        input,
-        last_confirmed_frame,
-        last_confirmed_hash,
+    // handle mouse input, if any
+    let (camera, camera_transform) = camera.single();
+    if let Some(pos) = window
+        .single()
+        .cursor_position()
+        .and_then(|cursor| camera.viewport_to_world(camera_transform, cursor))
+        .map(|ray| ray.origin.truncate())
+    {
+        input.mouse_visible = 1;
+        input.mouse_clicked = if mouse_buttons.just_released(MouseButton::Left) {
+            1
+        } else {
+            0
+        };
+        input.mouse_x = pos.x as i32;
+        input.mouse_y = pos.y as i32;
     }
+
+    input
 }
 
 pub fn apply_inputs(
@@ -226,6 +251,14 @@ pub fn apply_inputs(
         if new_vel_x != v.linvel.x || new_vel_y != v.linvel.y {
             v.linvel.x = new_vel_x;
             v.linvel.y = new_vel_y;
+        }
+
+        // handle mouse, if any
+        if game_input.mouse_visible == 1 {
+            log::info!("mouse visible! {:?}", game_input);
+        }
+        if game_input.mouse_clicked == 1 {
+            log::info!("mouse clicked! {:?}", game_input);
         }
     }
 }
